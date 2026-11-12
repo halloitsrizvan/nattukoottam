@@ -7,4 +7,10 @@ tmp
 .idea
 .vscode
 *.log
+.env
+.env.*
+.neon
+.claude
+node_modules
+apps/web/.next
 
