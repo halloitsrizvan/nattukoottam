@@ -1,33 +1,28 @@
 /**
- * Dynamically resolves the API base URL.
- * When accessed from a local network device (e.g. friend's laptop or mobile on 192.168.0.111:4200),
- * this uses the relative '/api' route which is proxied by Next.js rewrites on port 4200 directly
- * to the backend on port 3000.
- * This completely avoids Windows Firewall port 3000 blocks and cross-origin CORS failures!
+ * Resolves an absolute API base URL for both fetch() and new URL().
+ * In the browser, /api uses the current origin so Next.js can proxy requests
+ * to the backend, including when the app is opened from another LAN device.
+ * Server-side requests use the local backend origin by default.
  */
 export function getApiBaseUrl(): string {
-  if (process.env.NEXT_PUBLIC_API_URL) {
-    return process.env.NEXT_PUBLIC_API_URL;
-  }
-  if (typeof window !== 'undefined') {
-    return `${window.location.origin}/api`;
-  }
-  return 'http://localhost:3000/api';
+  const apiBase = process.env.NEXT_PUBLIC_API_URL || '/api';
+  const origin = typeof window !== 'undefined'
+    ? window.location.origin
+    : 'http://localhost:3000';
+
+  return new URL(apiBase, origin).toString().replace(/\/+$/, '');
 }
 
-export function buildApiUrl(endpoint: string, params?: Record<string, string | number | undefined>): string {
-  const apiBase = getApiBaseUrl();
-  const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
-  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
-  const fullUrlStr = apiBase.startsWith('http') ? `${apiBase}${cleanEndpoint}` : `${origin}${apiBase}${cleanEndpoint}`;
-  const url = new URL(fullUrlStr);
+export function buildApiUrl(
+  endpoint: string,
+  params?: Record<string, string | number | undefined>,
+): string {
+  const url = new URL(`${getApiBaseUrl()}/${endpoint.replace(/^\/+/, '')}`);
 
-  if (params) {
-    Object.entries(params).forEach(([key, val]) => {
-      if (val !== undefined && val !== null && val !== '') {
-        url.searchParams.set(key, String(val));
-      }
-    });
+  for (const [key, value] of Object.entries(params ?? {})) {
+    if (value !== undefined && value !== '') {
+      url.searchParams.set(key, String(value));
+    }
   }
 
   return url.toString();
@@ -58,15 +53,31 @@ export function removeStoredTokens() {
   localStorage.removeItem(REFRESH_KEY);
 }
 
-export function getAuthHeaders(): HeadersInit {
+export function getAuthHeaders(jsonBody = true): HeadersInit {
   const token = getStoredToken();
-  const headers: HeadersInit = {
-    'Content-Type': 'application/json',
-  };
+  const headers: HeadersInit = {};
+  if (jsonBody) headers['Content-Type'] = 'application/json';
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
   }
   return headers;
+}
+
+async function readApiResponse(res: Response, fallbackMessage: string) {
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const message = data?.message;
+    throw new Error(
+      (Array.isArray(message) ? message.join(', ') : message) ||
+      (res.status >= 500
+        ? `${fallbackMessage} (HTTP ${res.status}). Check that the backend API is running and reachable.`
+        : `${fallbackMessage} (HTTP ${res.status}).`),
+    );
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error(`${fallbackMessage}: the backend returned an invalid JSON response.`);
+  }
+  return data;
 }
 
 export interface LoginParams {
@@ -125,32 +136,28 @@ export async function registerApi(params: RegisterParams) {
   return data;
 }
 
-export async function syncClerkUserApi(data: {
+// Sync Clerk user information with backend and obtain JWT session
+export async function syncClerkUserApi(params: {
   clerkId: string;
   email?: string;
   phone?: string;
-  fullName?: string;
+  fullName: string;
   avatarUrl?: string;
-  district?: string;
-  locality?: string;
+  district: string;
+  locality: string;
 }) {
   const apiBase = getApiBaseUrl();
   const res = await fetch(`${apiBase}/auth/clerk-sync`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
+    headers: getAuthHeaders(),
+    body: JSON.stringify(params),
   });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: 'Clerk sync failed' }));
-    throw new Error(err.message || 'Failed to synchronize Clerk user');
+  const data = await readApiResponse(res, 'Failed to sync Clerk user');
+  // Store tokens if provided
+  if (data.tokens?.accessToken) {
+    saveStoredTokens(data.tokens.accessToken, data.tokens.refreshToken);
   }
-
-  const result = await res.json();
-  if (result.tokens?.accessToken) {
-    saveStoredTokens(result.tokens.accessToken, result.tokens.refreshToken);
-  }
-  return result;
+  return data;
 }
 
 export async function getCurrentUserApi() {
@@ -241,8 +248,8 @@ export async function createLivePostApi(postData: any) {
 
 export async function transcribeVoiceAudioApi(
   audioBlob: Blob,
-  language: string = 'ml',
-  uploadAudio: boolean = true
+  language = 'ml',
+  uploadAudio = true
 ): Promise<{ text: string; audioUrl?: string; warning?: string; error?: string }> {
   try {
     const apiBase = getApiBaseUrl();
@@ -253,16 +260,12 @@ export async function transcribeVoiceAudioApi(
 
     const res = await fetch(`${apiBase}/storage/transcribe?upload=${uploadAudio ? 'true' : 'false'}`, {
       method: 'POST',
-      headers: getAuthHeaders(),
+      // Let fetch set the multipart content type, including the audio boundary.
+      headers: getAuthHeaders(false),
       body: formData,
     });
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => null);
-      throw new Error(err?.message || 'Failed to transcribe audio');
-    }
-
-    return await res.json();
+    return await readApiResponse(res, 'Failed to transcribe audio');
   } catch (error: any) {
     console.warn('Transcription API error:', error);
     return { text: '', error: error.message };
@@ -294,8 +297,10 @@ export async function fetchLiveIssues(params?: string | { locality?: string; dis
 
 export async function fetchLiveConflicts(locality?: string) {
   try {
-    const url = buildApiUrl('projects/conflicts', locality ? { locality } : undefined);
-    const res = await fetch(url, { cache: 'no-store' });
+    const apiBase = getApiBaseUrl();
+    const url = new URL(`${apiBase}/projects/conflicts`);
+    if (locality) url.searchParams.set('locality', locality);
+    const res = await fetch(url.toString(), { cache: 'no-store' });
     if (!res.ok) throw new Error('Failed to fetch conflicts');
     const json = await res.json();
     return Array.isArray(json) ? json : json.data || [];
